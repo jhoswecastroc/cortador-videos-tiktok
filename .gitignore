@@ -1,0 +1,14 @@
+# Entorno virtual y caché de Python
+.venv/
+__pycache__/
+
+# Videos: nunca van al repositorio
+*.mp4
+*.mov
+*.mkv
+*.avi
+
+# Empaquetado
+build/
+dist/
+*.spec
