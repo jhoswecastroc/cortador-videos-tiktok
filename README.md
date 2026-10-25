@@ -1,273 +1,186 @@
-import os
-import re
-import subprocess
-import threading
-from tkinter import filedialog, messagebox
+# Cortador de series para TikTok
 
-import customtkinter as ctk
+Aplicación de escritorio con interfaz gráfica para preparar videos largos antes de subirlos a TikTok (o a cualquier plataforma). Usa **FFmpeg** por debajo, así que conserva la calidad en 1080p.
 
-NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-TIPOS_VIDEO = [("Video", "*.mp4 *.mov *.mkv *.avi"), ("Todos", "*.*")]
-SIN_VIDEO = "Ningún video seleccionado"
+![Captura de la aplicación](docs/captura.png)
 
-def a_segundos(texto):
-"""Acepta '508', '8:28' o '1:08:28'."""
-total = 0.0
-for p in texto.strip().split(":"):
-total = total \* 60 + float(p)
-return total
+## Qué hace
 
-def tiene_stream(ruta, tipo):
-"""tipo: 'v:0' para video, 'a:0' para audio."""
-r = subprocess.run(
-["ffprobe", "-v", "error", "-select_streams", tipo,
-"-show_entries", "stream=codec_type",
-"-of", "default=nw=1:nk=1", ruta],
-capture_output=True, text=True, creationflags=NO_WINDOW)
-return bool(r.stdout.strip())
+**Dividir en capítulos**
 
-def duracion(ruta): # Intentos 1 y 2: metadatos del contenedor y del stream de video
-for entrada in ("format=duration", "stream=duration"):
-r = subprocess.run(
-["ffprobe", "-v", "error", "-select_streams", "v:0",
-"-show_entries", entrada, "-of", "default=nw=1:nk=1", ruta],
-capture_output=True, text=True, creationflags=NO_WINDOW)
-for token in r.stdout.split():
-try:
-valor = float(token)
-if valor > 0:
-return valor
-except ValueError:
-pass
+- Parte un video en la cantidad de capítulos que quieras, por tiempos exactos o en partes iguales.
+- Aplica fundido de entrada y salida (imagen y audio) a cada capítulo.
+- Los capítulos 2 en adelante empiezan unos segundos antes, para que el espectador recuerde dónde quedó la historia.
 
-    # Intento 3: recorrer el archivo sin recodificar y leer el último time=
-    r = subprocess.run(
-        ["ffmpeg", "-i", ruta, "-c", "copy", "-f", "null", "-"],
-        capture_output=True, text=True, errors="replace",
-        creationflags=NO_WINDOW)
-    tiempos = re.findall(r"time=(\d+):(\d+):(\d+\.\d+)", r.stderr)
-    if tiempos:
-        h, m, s = tiempos[-1]
-        return int(h) * 3600 + int(m) * 60 + float(s)
+**Quitar tramo**
 
-    raise RuntimeError("No pude determinar la duración. ffmpeg dijo: " + r.stderr[-400:])
+- Elimina un tramo del video (por ejemplo, una parte con música que la plataforma rechaza) y une las dos partes restantes con un fundido corto.
 
-class App(ctk.CTk):
-def **init**(self):
-super().**init**()
-self.title("Cortador de series para TikTok")
-self.geometry("640x800")
-self.rutas = {"dividir": None, "quitar": None}
-self.etiquetas = {}
-self.campos = {}
+Todo se recodifica una sola vez con `libx264`, `CRF 17` y `preset slow`, que es prácticamente indistinguible del original.
 
-        tabs = ctk.CTkTabview(self, height=370)
-        tabs.pack(fill="x", padx=15, pady=(12, 6))
-        tab1 = tabs.add("Dividir en capítulos")
-        tab2 = tabs.add("Quitar tramo")
+## Requisitos
 
-        # ---- Pestaña 1: dividir ----
-        self.selector(tab1, "dividir")
-        self.campo(tab1, "cortes", "Puntos de corte (ej: 8:28, 16:56)", "")
-        self.campo(tab1, "partes", "Partes iguales (si dejas cortes vacío)", "3")
-        self.campo(tab1, "solape", "Solape en capítulos 2+ (seg)", "2")
-        self.campo(tab1, "fade_in", "Fade in (seg)", "0.5")
-        self.campo(tab1, "fade_out", "Fade out (seg)", "0.8")
-        self.campo(tab1, "crf", "Calidad CRF (16-20, menor = mejor)", "17")
-        b1 = ctk.CTkButton(tab1, text="Exportar capítulos", command=self.clic_dividir)
-        b1.pack(pady=12)
+- **Python 3.10 o superior** (probado con 3.14)
+- **FFmpeg** (incluye `ffprobe`) disponible en el PATH
+- Probado en **Windows 11**. En macOS y Linux debería funcionar, pero no está probado.
 
-        # ---- Pestaña 2: quitar tramo ----
-        self.selector(tab2, "quitar")
-        self.campo(tab2, "q_ini", "Inicio del tramo a quitar (ej: 2:10)", "")
-        self.campo(tab2, "q_fin", "Fin del tramo a quitar (ej: 3:45)", "")
-        self.campo(tab2, "q_fade", "Fundido en la unión (seg, 0 = corte seco)", "0.3")
-        self.campo(tab2, "q_crf", "Calidad CRF (16-20, menor = mejor)", "17")
-        b2 = ctk.CTkButton(tab2, text="Quitar tramo y unir", command=self.clic_quitar)
-        b2.pack(pady=12)
+## Instalación (se hace una sola vez )
 
-        # ---- Zona común: barra, log y limpiar ----
-        self.barra = ctk.CTkProgressBar(self, width=540)
-        self.barra.set(0)
-        self.barra.pack(pady=(6, 0))
-        self.log = ctk.CTkTextbox(self, width=590, height=170)
-        self.log.pack(pady=10)
-        self.btn_limpiar = ctk.CTkButton(
-            self, text="Limpiar todo", fg_color="gray30", command=self.limpiar)
-        self.btn_limpiar.pack(pady=(0, 10))
+1. Instala [Python](https://www.python.org/downloads/) y marca **"Add python.exe to PATH"** durante la instalación.
 
-        self.botones = [b1, b2, self.btn_limpiar]
+2. Instala FFmpeg. En Windows:
 
-    # ---------- construcción de la interfaz ----------
-    def selector(self, padre, clave):
-        ctk.CTkButton(padre, text="Elegir video",
-                      command=lambda: self.elegir(clave)).pack(pady=(8, 4))
-        etiqueta = ctk.CTkLabel(padre, text=SIN_VIDEO)
-        etiqueta.pack(pady=(0, 8))
-        self.etiquetas[clave] = etiqueta
+   ```bash
+   winget install Gyan.FFmpeg
+   ```
 
-    def campo(self, padre, clave, etiqueta, defecto):
-        fila = ctk.CTkFrame(padre, fg_color="transparent")
-        fila.pack(fill="x", padx=15, pady=3)
-        ctk.CTkLabel(fila, text=etiqueta, width=290, anchor="w").pack(side="left")
-        e = ctk.CTkEntry(fila, width=200)
-        e.insert(0, defecto)
-        e.pack(side="right")
-        self.campos[clave] = e
+   Cierra y vuelve a abrir la terminal, y verifica que ambos respondan:
 
-    # ---------- acciones de la interfaz ----------
-    def elegir(self, clave):
-        ruta = filedialog.askopenfilename(filetypes=TIPOS_VIDEO)
-        if ruta:
-            self.rutas[clave] = ruta
-            self.etiquetas[clave].configure(text=os.path.basename(ruta))
+   ```bash
+   ffmpeg -version
+   ffprobe -version
+   ```
 
-    def limpiar(self):
-        self.log.delete("1.0", "end")
-        self.barra.set(0)
-        for clave in self.rutas:
-            self.rutas[clave] = None
-            self.etiquetas[clave].configure(text=SIN_VIDEO)
-        for clave in ("cortes", "q_ini", "q_fin"):
-            self.campos[clave].delete(0, "end")
+3. Clona el repositorio y entra a la carpeta:
 
-    def escribir(self, txt):
-        self.after(0, lambda: (self.log.insert("end", txt + "\n"), self.log.see("end")))
+   ```bash
+   git clone https://github.com/TU_USUARIO/cortador-series-tiktok.git
+   cd cortador-series-tiktok
+   ```
 
-    def bloquear(self, estado):
-        for b in self.botones:
-            b.configure(state=estado)
+4. Crea el entorno virtual (una carpeta `.venv` donde viven las librerías de este proyecto):
 
-    def lanzar(self, tarea):
-        """Ejecuta 'tarea' en un hilo aparte para no congelar la ventana."""
-        self.bloquear("disabled")
+   ```bash
+   python -m venv .venv
+   ```
 
-        def trabajo():
-            try:
-                tarea()
-            except subprocess.CalledProcessError as e:
-                self.escribir("Error de FFmpeg: " + (e.stderr or str(e))[-500:])
-            except Exception as e:
-                self.escribir(f"Error: {e}")
-            finally:
-                self.after(0, lambda: self.bloquear("normal"))
+5. Actívalo (ver la siguiente sección) e instala las dependencias:
 
-        threading.Thread(target=trabajo, daemon=True).start()
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-    # ---------- botón: dividir ----------
-    def clic_dividir(self):
-        ruta = self.rutas["dividir"]
-        if not ruta:
-            messagebox.showwarning("Falta el video", "Elige un video primero.")
-            return
-        # Leemos los campos AQUÍ (hilo principal), no dentro del hilo de trabajo
-        c = {k: self.campos[k].get().strip()
-             for k in ("cortes", "partes", "solape", "fade_in", "fade_out", "crf")}
-        self.lanzar(lambda: self.dividir(ruta, c))
+## Cómo ejecutarlo cada vez
 
-    def dividir(self, ruta, c):
-        if not tiene_stream(ruta, "v:0"):
-            raise RuntimeError("Este archivo no contiene video. Revisa que sea un video real.")
+El entorno virtual **se activa por terminal**: cada vez que abres una terminal nueva (o reinicias tu editor) empieza _sin_ entorno. Si ejecutas el programa sin activarlo, verás `ModuleNotFoundError: No module named 'customtkinter'`, porque la librería está instalada dentro del `.venv` y no en tu Python global.
 
-        solape, fin_in, fin_out = float(c["solape"]), float(c["fade_in"]), float(c["fade_out"])
-        total = duracion(ruta)
+**Paso 1. Entra a la carpeta del proyecto**
 
-        if c["cortes"]:
-            cortes = sorted(a_segundos(t) for t in c["cortes"].split(","))
-        else:
-            n = int(c["partes"])
-            cortes = [total / n * i for i in range(1, n)]
+```bash
+cd cortador-series-tiktok
+```
 
-        limites = [0] + cortes + [total]
-        base, _ = os.path.splitext(ruta)
-        n_partes = len(limites) - 1
-        self.after(0, lambda: self.barra.set(0))
+**Paso 2. Activa el entorno** (elige según tu terminal):
 
-        for i in range(n_partes):
-            inicio = max(0, limites[i] - (solape if i > 0 else 0))
-            dur = limites[i + 1] - inicio
-            salida = f"{base}_parte{i + 1}.mp4"
+| Terminal      | Cómo reconocerla                  | Comando                         |
+| ------------- | --------------------------------- | ------------------------------- |
+| Git Bash      | Muestra `MINGW64` en el prompt    | `source .venv/Scripts/activate` |
+| PowerShell    | El prompt empieza con `PS C:\...` | `.venv\Scripts\Activate.ps1`    |
+| CMD           | El prompt es `C:\...>`            | `.venv\Scripts\activate.bat`    |
+| macOS / Linux |                                   | `source .venv/bin/activate`     |
 
-            vf = (f"fade=t=in:st=0:d={fin_in},"
-                  f"fade=t=out:st={dur - fin_out}:d={fin_out}")
-            af = (f"afade=t=in:st=0:d={fin_in},"
-                  f"afade=t=out:st={dur - fin_out}:d={fin_out}")
+Sabrás que funcionó porque aparece **`(.venv)`** al inicio de la línea:
 
-            self.escribir(f"Exportando parte {i + 1}/{n_partes} ({dur / 60:.1f} min)...")
-            subprocess.run(
-                ["ffmpeg", "-y", "-ss", str(inicio), "-i", ruta, "-t", str(dur),
-                 "-vf", vf, "-af", af,
-                 "-c:v", "libx264", "-crf", c["crf"], "-preset", "slow",
-                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                 "-movflags", "+faststart", salida],
-                check=True, capture_output=True, text=True, errors="replace",
-                creationflags=NO_WINDOW)
-            self.after(0, lambda v=(i + 1) / n_partes: self.barra.set(v))
-            self.escribir(f"  OK -> {os.path.basename(salida)}")
+```
+(.venv) usuario@PC ~/cortador-series-tiktok
+```
 
-        self.escribir("Listo.")
+Atención en Git Bash: usa siempre `/` en las rutas. La barra invertida `\` se interpreta como carácter de escape y el comando falla.
 
-    # ---------- botón: quitar tramo ----------
-    def clic_quitar(self):
-        ruta = self.rutas["quitar"]
-        if not ruta:
-            messagebox.showwarning("Falta el video", "Elige un video primero.")
-            return
-        c = {k: self.campos[k].get().strip()
-             for k in ("q_ini", "q_fin", "q_fade", "q_crf")}
-        self.lanzar(lambda: self.quitar(ruta, c))
+**Paso 3. Ejecuta el programa**
 
-    def quitar(self, ruta, c):
-        if not tiene_stream(ruta, "v:0"):
-            raise RuntimeError("Este archivo no contiene video.")
-        if not tiene_stream(ruta, "a:0"):
-            raise RuntimeError("Este video no tiene pista de audio, no hay música que quitar.")
-        if not c["q_ini"] or not c["q_fin"]:
-            raise RuntimeError("Escribe el inicio y el fin del tramo a quitar.")
+```bash
+python cortador.py
+```
 
-        ini, fin = a_segundos(c["q_ini"]), a_segundos(c["q_fin"])
-        total = duracion(ruta)
-        if not (0 < ini < fin < total):
-            raise RuntimeError(
-                f"El tramo debe estar en medio del video (0 a {total:.1f} s) "
-                "y el inicio debe ser menor que el fin.")
+**Para salir del entorno:** escribe `deactivate`.
 
-        # El fundido no puede ser más largo que el trozo más corto
-        f = min(float(c["q_fade"]), ini, total - fin)
+### Alternativas sin activar nada
 
-        fo_v = f",fade=t=out:st={ini - f:.3f}:d={f:.3f}" if f > 0 else ""
-        fo_a = f",afade=t=out:st={ini - f:.3f}:d={f:.3f}" if f > 0 else ""
-        fi_v = f",fade=t=in:st=0:d={f:.3f}" if f > 0 else ""
-        fi_a = f",afade=t=in:st=0:d={f:.3f}" if f > 0 else ""
+- **Llamar directo al Python del entorno** (funciona desde cualquier terminal, sin activar):
 
-        filtro = (
-            f"[0:v]trim=start=0:end={ini:.3f},setpts=PTS-STARTPTS{fo_v}[v0];"
-            f"[0:a]atrim=start=0:end={ini:.3f},asetpts=PTS-STARTPTS{fo_a}[a0];"
-            f"[0:v]trim=start={fin:.3f}:end={total:.3f},setpts=PTS-STARTPTS{fi_v}[v1];"
-            f"[0:a]atrim=start={fin:.3f}:end={total:.3f},asetpts=PTS-STARTPTS{fi_a}[a1];"
-            "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
-        )
+  ```bash
+  .venv/Scripts/python cortador.py
+  ```
 
-        base, _ = os.path.splitext(ruta)
-        salida = f"{base}_sin_tramo.mp4"
-        nueva = total - (fin - ini)
-        self.after(0, lambda: self.barra.set(0))
-        self.escribir(f"Quitando {fin - ini:.1f} s... el resultado durará {nueva / 60:.1f} min.")
-        self.escribir("Recodifica todo el video, puede tardar un rato.")
+- **Doble clic en Windows:** usa el archivo `ejecutar.bat` incluido en el repositorio. Abre el programa sin necesidad de terminal.
 
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", ruta, "-filter_complex", filtro,
-             "-map", "[v]", "-map", "[a]",
-             "-c:v", "libx264", "-crf", c["q_crf"], "-preset", "slow",
-             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-             "-movflags", "+faststart", salida],
-            check=True, capture_output=True, text=True, errors="replace",
-            creationflags=NO_WINDOW)
+- **Desde VS Code o Cursor:** `Ctrl+Shift+P` → **Python: Select Interpreter** → elige el que dice `.venv`. A partir de ahí, el editor activa el entorno solo cada vez que abres una terminal nueva dentro de él.
 
-        self.after(0, lambda: self.barra.set(1))
-        self.escribir(f"  OK -> {os.path.basename(salida)}")
-        self.escribir("Listo.")
+## Uso
 
-if **name** == "**main**":
-ctk.set_appearance_mode("dark")
-App().mainloop()
+### Pestaña "Dividir en capítulos"
+
+| Campo              | Qué hace                                                                                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Puntos de corte    | Momentos donde **termina** cada capítulo, separados por coma (`8:28, 16:56`). N cortes producen N+1 capítulos. Si lo llenas, ignora "Partes iguales". |
+| Partes iguales     | Cantidad de capítulos de igual duración (no la duración de cada uno). Solo se usa si no hay puntos de corte.                                          |
+| Solape             | Segundos que los capítulos 2+ retroceden al inicio. `0` = corte seco.                                                                                 |
+| Fade in / Fade out | Duración del fundido al inicio y al final de cada capítulo. `0` = sin fundido. Mantén el fade in menor que el solape.                                 |
+| Calidad CRF        | 16-20. Menor = más calidad y más peso. 17 es casi idéntico al original.                                                                               |
+
+Los capítulos se guardan junto al video original como `nombre_parte1.mp4`, `nombre_parte2.mp4`, etc.
+
+### Pestaña "Quitar tramo"
+
+1. Elige el video.
+2. Escribe el inicio y el fin del tramo a eliminar (`2:10` y `3:45`). Los tiempos son del archivo que cargaste.
+3. Elige la duración del fundido en la unión (`0` = corte seco).
+4. El resultado se guarda como `nombre_sin_tramo.mp4`.
+
+El tramo debe estar en medio del video, no pegado al inicio ni al final.
+
+### Botón "Limpiar todo"
+
+Vacía el registro, la barra de progreso, el video seleccionado y los tiempos de corte. No borra ningún archivo exportado.
+
+## Consejos
+
+- Corta en un giro de la historia o una frase fuerte, no en una pausa muerta.
+- Si necesitas quitar un tramo y además dividir, **quita el tramo primero** y divide después: así recodificas una sola vez.
+- Deja 1 o 2 segundos de margen alrededor de lo que quieres quitar.
+- Prueba siempre con un clip corto antes de procesar un video de 25 minutos.
+
+## Problemas frecuentes
+
+**`ModuleNotFoundError: No module named 'customtkinter'`**
+El entorno virtual no está activo en esta terminal. Mira la sección "Cómo ejecutarlo cada vez": activa el entorno (debe aparecer `(.venv)`) o ejecuta con `.venv/Scripts/python cortador.py`.
+
+**`FileNotFoundError` o "ffmpeg no encontrado"**
+FFmpeg no está en el PATH. Reinstálalo y reabre la terminal y el editor.
+
+**Windows bloquea ffmpeg ("Una directiva de Control de aplicaciones bloqueó este archivo")**
+Es Smart App Control, que bloquea ejecutables sin firma. Puedes desactivarlo en _Seguridad de Windows → Control de aplicaciones y navegador_. Es irreversible sin reinstalar Windows: decide tú.
+
+**PowerShell: "la ejecución de scripts está deshabilitada"**
+Ejecuta una vez: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+
+**En Git Bash: `.venvScriptsActivate.ps1: command not found`**
+Escribiste el comando con `\`. En Git Bash se usa `source .venv/Scripts/activate`.
+
+**"Este archivo no contiene video"**
+La extensión `.mp4` no garantiza el contenido. Puede ser un archivo de subtítulos u otro formato con nombre equivocado.
+
+**"No pude determinar la duración"**
+El archivo no tiene marcas de tiempo válidas o está dañado. Prueba con el video original exportado desde tu editor.
+
+## Crear un .exe (opcional)
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed cortador.py
+```
+
+El ejecutable queda en `dist/`. Ten en cuenta que no va firmado: Windows o tu antivirus pueden bloquearlo o marcarlo como sospechoso. Y FFmpeg sigue siendo un requisito aparte.
+
+## Aviso
+
+Usa esta herramienta solo con contenido propio o con autorización de sus titulares. No garantiza que una plataforma acepte el video resultante, y cada quien es responsable de cumplir las normas de la plataforma donde publica.
+
+## Licencia
+
+MIT. Consulta el archivo `LICENSE`.
+
+## Contribuir
+
+Se aceptan issues y pull requests. Ideas pendientes: cola de varios videos, duración fija por capítulo, formato vertical 9:16 con fondo difuminado.
